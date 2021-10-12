@@ -21,7 +21,12 @@ func (b binding) resolve(c Container) (interface{}, error) {
 		return b.instance, nil
 	}
 
-	return c.invoke(b.resolver)
+	out, err := c.invoke(b.resolver)
+	if err != nil {
+		return nil, err
+	}
+
+	return out[0].Interface(), nil
 }
 
 // Container holds all of the declared bindings
@@ -33,24 +38,37 @@ func New() Container {
 }
 
 // bind maps an abstraction to a concrete and sets an instance if it's a singleton binding.
-func (c Container) bind(resolver interface{}, name string, singleton bool) error {
+func (c Container) bind(resolver interface{}, name string, singleton bool) (err error) {
 	reflectedResolver := reflect.TypeOf(resolver)
 	if reflectedResolver.Kind() != reflect.Func {
 		return errors.New("container: the resolver must be a function")
 	}
 
+	var instances []reflect.Value
+	switch {
+	case singleton:
+		if instances, err = c.invoke(resolver); err != nil {
+			return
+		}
+
+	case !singleton && reflectedResolver.NumOut() > 2,
+		!singleton && reflectedResolver.NumOut() == 2 && !c.isError(reflectedResolver.Out(1)),
+		!singleton && reflectedResolver.NumOut() == 1 && c.isError(reflectedResolver.Out(0)):
+		return errors.New("container: transient value resolvers must return exactly one value and optionally one error")
+	}
+
 	for i := 0; i < reflectedResolver.NumOut(); i++ {
+		// we are not interested in returned errors
+		if c.isError(reflectedResolver.Out(i)) {
+			continue
+		}
+
 		if _, exist := c[reflectedResolver.Out(i)]; !exist {
 			c[reflectedResolver.Out(i)] = make(map[string]binding)
 		}
 
 		if singleton {
-			instance, err := c.invoke(resolver)
-			if err != nil {
-				return err
-			}
-
-			c[reflectedResolver.Out(i)][name] = binding{resolver: resolver, instance: instance}
+			c[reflectedResolver.Out(i)][name] = binding{resolver: resolver, instance: instances[i].Interface()}
 		} else {
 			c[reflectedResolver.Out(i)][name] = binding{resolver: resolver}
 		}
@@ -60,14 +78,23 @@ func (c Container) bind(resolver interface{}, name string, singleton bool) error
 }
 
 // invoke calls a function and returns the yielded value.
-// It only works for functions that return a single value.
-func (c Container) invoke(function interface{}) (interface{}, error) {
+func (c Container) invoke(function interface{}) ([]reflect.Value, error) {
 	args, err := c.arguments(function)
 	if err != nil {
 		return nil, err
 	}
 
-	return reflect.ValueOf(function).Call(args)[0].Interface(), nil
+	out := reflect.ValueOf(function).Call(args)
+	// if there is more than one returned value and the last one is error and it's not nil then return it
+	if len(out) > 1 && c.isError(out[len(out)-1].Type()) && !out[len(out)-1].IsNil() {
+		return nil, out[len(out)-1].Interface().(error)
+	}
+
+	return out, nil
+}
+
+func (c Container) isError(v reflect.Type) bool {
+	return v.Implements(reflect.TypeOf((*error)(nil)).Elem())
 }
 
 // arguments returns container-resolved arguments of a function.
@@ -130,12 +157,16 @@ func (c Container) Call(function interface{}) error {
 		return errors.New("container: invalid function")
 	}
 
-	arguments, err := c.arguments(function)
+	args, err := c.arguments(function)
 	if err != nil {
 		return err
 	}
 
-	reflect.ValueOf(function).Call(arguments)
+	out := reflect.ValueOf(function).Call(args)
+	// if there is something returned from a function and the last value is error and it's not nil then return it
+	if len(out) > 0 && out[len(out)-1].Type().Implements(reflect.TypeOf((*error)(nil)).Elem()) && !out[len(out)-1].IsNil() {
+		return out[len(out)-1].Interface().(error)
+	}
 
 	return nil
 }
@@ -156,9 +187,11 @@ func (c Container) NamedResolve(abstraction interface{}, name string) error {
 		elem := receiverType.Elem()
 
 		if concrete, exist := c[elem][name]; exist {
-			instance, _ := concrete.resolve(c)
-
-			reflect.ValueOf(abstraction).Elem().Set(reflect.ValueOf(instance))
+			if instance, err := concrete.resolve(c); err != nil {
+				return err
+			} else {
+				reflect.ValueOf(abstraction).Elem().Set(reflect.ValueOf(instance))
+			}
 
 			return nil
 		}
@@ -169,105 +202,50 @@ func (c Container) NamedResolve(abstraction interface{}, name string) error {
 	return errors.New("container: invalid abstraction")
 }
 
-// Fill takes a struct and resolves the fields with the tag `container:"inject"`.
-// Alternatively map[string]Type or []Type can be provided. It will be filled with all available implementations of provided Type.
-func (c Container) Fill(receiver interface{}) error {
-	receiverType := reflect.TypeOf(receiver)
+// Fill takes a struct and resolves the fields with the tag `container:"inject"`
+func (c Container) Fill(structure interface{}) error {
+	receiverType := reflect.TypeOf(structure)
 	if receiverType == nil {
-		return errors.New("container: invalid receiver")
+		return errors.New("container: invalid structure")
 	}
 
-	if receiverType.Kind() != reflect.Ptr {
-		return errors.New("container: receiver is not a pointer")
-	}
+	if receiverType.Kind() == reflect.Ptr {
+		elem := receiverType.Elem()
+		if elem.Kind() == reflect.Struct {
+			s := reflect.ValueOf(structure).Elem()
 
-	elem := receiverType.Elem()
+			for i := 0; i < s.NumField(); i++ {
+				f := s.Field(i)
 
-	switch receiverType.Elem().Kind() {
-	case reflect.Struct:
-		return c.fillStruct(receiver)
+				if t, exist := s.Type().Field(i).Tag.Lookup("container"); exist {
+					var name string
 
-	case reflect.Slice:
-		return c.fillSlice(receiver)
+					if t == "type" {
+						name = ""
+					} else if t == "name" {
+						name = s.Type().Field(i).Name
+					} else {
+						return errors.New(
+							fmt.Sprintf("container: %v has an invalid struct tag", s.Type().Field(i).Name),
+						)
+					}
 
-	case reflect.Map:
-		if elem.Key().Name() != "string" {
-			break
-		}
+					if concrete, exist := c[f.Type()][name]; exist {
+						instance, _ := concrete.resolve(c)
 
-		return c.fillMap(receiver)
-	}
+						ptr := reflect.NewAt(f.Type(), unsafe.Pointer(f.UnsafeAddr())).Elem()
+						ptr.Set(reflect.ValueOf(instance))
 
-	return errors.New("container: invalid receiver")
-}
+						continue
+					}
 
-func (c Container) fillStruct(receiver interface{}) error {
-	s := reflect.ValueOf(receiver).Elem()
-
-	for i := 0; i < s.NumField(); i++ {
-		f := s.Field(i)
-
-		if t, exist := s.Type().Field(i).Tag.Lookup("container"); exist {
-			var name string
-
-			if t == "type" {
-				name = ""
-			} else if t == "name" {
-				name = s.Type().Field(i).Name
-			} else {
-				return errors.New(
-					fmt.Sprintf("container: %v has an invalid struct tag", s.Type().Field(i).Name),
-				)
+					return errors.New(fmt.Sprintf("container: cannot resolve %v field", s.Type().Field(i).Name))
+				}
 			}
 
-			if concrete, exist := c[f.Type()][name]; exist {
-				instance, _ := concrete.resolve(c)
-
-				ptr := reflect.NewAt(f.Type(), unsafe.Pointer(f.UnsafeAddr())).Elem()
-				ptr.Set(reflect.ValueOf(instance))
-
-				continue
-			}
-
-			return errors.New(fmt.Sprintf("container: cannot resolve %v field", s.Type().Field(i).Name))
+			return nil
 		}
 	}
 
-	return nil
-}
-
-func (c Container) fillSlice(receiver interface{}) error {
-	elem := reflect.TypeOf(receiver).Elem()
-
-	if _, exist := c[elem.Elem()]; exist {
-		result := reflect.MakeSlice(reflect.SliceOf(elem.Elem()), 0, len(c[elem.Elem()]))
-
-		for _, concrete := range c[elem.Elem()] {
-			instance, _ := concrete.resolve(c)
-
-			result = reflect.Append(result, reflect.ValueOf(instance))
-		}
-
-		reflect.ValueOf(receiver).Elem().Set(result)
-	}
-
-	return nil
-}
-
-func (c Container) fillMap(receiver interface{}) error {
-	elem := reflect.TypeOf(receiver).Elem()
-
-	if _, exist := c[elem.Elem()]; exist {
-		result := reflect.MakeMapWithSize(reflect.MapOf(elem.Key(), elem.Elem()), len(c[elem.Elem()]))
-
-		for name, concrete := range c[elem.Elem()] {
-			instance, _ := concrete.resolve(c)
-
-			result.SetMapIndex(reflect.ValueOf(name), reflect.ValueOf(instance))
-		}
-
-		reflect.ValueOf(receiver).Elem().Set(result)
-	}
-
-	return nil
+	return errors.New("container: invalid structure")
 }

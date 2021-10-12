@@ -1,7 +1,7 @@
 package container_test
 
 import (
-	"reflect"
+	"errors"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -24,18 +24,6 @@ func (c *Circle) SetArea(a int) {
 
 func (c Circle) GetArea() int {
 	return c.a
-}
-
-type Rectangle struct {
-	a int
-}
-
-func (s *Rectangle) SetArea(a int) {
-	s.a = a
-}
-
-func (s Rectangle) GetArea() int {
-	return s.a
 }
 
 type Database interface {
@@ -69,6 +57,31 @@ func TestContainer_Singleton(t *testing.T) {
 		assert.Equal(t, a, 666)
 	})
 	assert.NoError(t, err)
+}
+
+func TestContainer_Singleton_Multi(t *testing.T) {
+	instance.Reset()
+
+	err := instance.Singleton(func() (Shape, Database, error) {
+		return &Rectangle{a: 777}, &MySQL{}, nil
+	})
+	assert.NoError(t, err)
+
+	var s Shape
+	assert.NoError(t, instance.Resolve(&s))
+	if _, ok := s.(*Rectangle); !ok {
+		t.Error("Expected Rectangle")
+	}
+
+	assert.Equal(t, 777, s.GetArea())
+
+	var db Database
+	assert.NoError(t, instance.Resolve(&db))
+	if _, ok := db.(*MySQL); !ok {
+		t.Error("Expected MySQL")
+	}
+
+	assert.EqualError(t, instance.Resolve(&err), "container: no concrete found for: error")
 }
 
 func TestContainer_Singleton_With_NonFunction_Resolver_It_Should_Fail(t *testing.T) {
@@ -140,6 +153,33 @@ func TestContainer_NamedTransient(t *testing.T) {
 	assert.Equal(t, sh.GetArea(), 13)
 }
 
+func TestContainer_Transient_Multi_Error(t *testing.T) {
+	instance.Reset()
+
+	err := instance.Transient(func() (Circle, Rectangle, Database) {
+		return Circle{a: 666}, Rectangle{a: 666}, &MySQL{}
+	})
+	assert.EqualError(t, err, "container: transient value resolvers must return exactly one value and optionally one error")
+
+	err = instance.Transient(func() (Shape, Database) {
+		return &Circle{a: 666}, &MySQL{}
+	})
+	assert.EqualError(t, err, "container: transient value resolvers must return exactly one value and optionally one error")
+
+	err = instance.Transient(func() error {
+		return errors.New("dummy error")
+	})
+	assert.EqualError(t, err, "container: transient value resolvers must return exactly one value and optionally one error")
+}
+
+func TestContainer_Bind_error(t *testing.T) {
+	err := instance.Singleton(func() (Shape, error) {
+		return nil, errors.New("binding error")
+	})
+
+	assert.EqualError(t, err, "binding error")
+}
+
 func TestContainer_Call_With_Multiple_Resolving(t *testing.T) {
 	err := instance.Singleton(func() Shape {
 		return &Circle{a: 5}
@@ -178,6 +218,18 @@ func TestContainer_Call_With_Second_UnBounded_Argument(t *testing.T) {
 
 	err = instance.Call(func(s Shape, d Database) {})
 	assert.EqualError(t, err, "container: no concrete found for: container_test.Database")
+}
+
+func TestContainer_Call_With_Returned_Error(t *testing.T) {
+	err := instance.Singleton(func() Shape {
+		return &Circle{}
+	})
+	assert.NoError(t, err)
+
+	err = instance.Call(func(s Shape) (err error) {
+		return errors.New("dummy error")
+	})
+	assert.EqualError(t, err, "dummy error")
 }
 
 func TestContainer_Resolve_With_Reference_As_Resolver(t *testing.T) {
@@ -226,6 +278,19 @@ func TestContainer_Resolve_With_UnBounded_Reference_It_Should_Fail(t *testing.T)
 	var s Shape
 	err := instance.Resolve(&s)
 	assert.EqualError(t, err, "container: no concrete found for: container_test.Shape")
+}
+
+func TestContainer_Resolve_Invoke_Error(t *testing.T) {
+	instance.Reset()
+
+	err := instance.Transient(func() (Shape, error) {
+		return nil, errors.New("dummy error")
+	})
+	assert.NoError(t, err)
+
+	var s Shape
+	err = instance.Resolve(&s)
+	assert.EqualError(t, err, "dummy error")
 }
 
 func TestContainer_Fill_With_Struct_Pointer(t *testing.T) {
@@ -282,16 +347,6 @@ func TestContainer_Fill_Unexported_With_Struct_Pointer(t *testing.T) {
 	assert.IsType(t, &MySQL{}, myApp.d)
 }
 
-func TestContainer_Fill_Without_Pointer(t *testing.T) {
-	err := instance.Singleton(func() Shape {
-		return &Circle{a: 5}
-	})
-	assert.NoError(t, err)
-
-	var db MySQL
-	assert.EqualError(t, instance.Fill(db), "container: receiver is not a pointer")
-}
-
 func TestContainer_Fill_With_Invalid_Field_It_Should_Fail(t *testing.T) {
 	err := instance.NamedSingleton("C", func() Shape {
 		return &Circle{a: 5}
@@ -333,80 +388,11 @@ func TestContainer_Fill_With_Invalid_Field_Name_It_Should_Fail(t *testing.T) {
 func TestContainer_Fill_With_Invalid_Struct_It_Should_Fail(t *testing.T) {
 	invalidStruct := 0
 	err := instance.Fill(&invalidStruct)
-	assert.EqualError(t, err, "container: invalid receiver")
+	assert.EqualError(t, err, "container: invalid structure")
 }
 
 func TestContainer_Fill_With_Invalid_Pointer_It_Should_Fail(t *testing.T) {
 	var s Shape
 	err := instance.Fill(s)
-	assert.EqualError(t, err, "container: invalid receiver")
-}
-
-func TestContainer_Fill_Invalid_Map(t *testing.T) {
-	err := instance.Singleton(func() Shape {
-		return &Circle{a: 5}
-	})
-	assert.NoError(t, err)
-
-	var list = map[int]Shape{}
-	assert.EqualError(t, instance.Fill(&list), "container: invalid receiver")
-}
-
-func TestContainer_Fill_With_Slice(t *testing.T) {
-	instance.Reset()
-
-	err := instance.NamedSingleton("circle", func() Shape {
-		return &Circle{a: 5}
-	})
-	assert.NoError(t, err)
-
-	err = instance.NamedSingleton("square", func() Shape {
-		return &Rectangle{a: 11}
-	})
-	assert.NoError(t, err)
-
-	var shapes []Shape
-	err = instance.Fill(&shapes)
-	assert.NoError(t, err)
-
-	assert.Equal(t, 2, len(shapes))
-
-	var list = map[string]struct{}{
-		reflect.TypeOf(shapes[0]).Elem().Name(): {},
-		reflect.TypeOf(shapes[1]).Elem().Name(): {},
-	}
-
-	_, ok := list["Circle"]
-	assert.True(t, ok)
-
-	_, ok = list["Rectangle"]
-	assert.True(t, ok)
-}
-
-func TestContainer_Fill_With_Map(t *testing.T) {
-	instance.Reset()
-
-	err := instance.NamedSingleton("circle", func() Shape {
-		return &Circle{a: 5}
-	})
-	assert.NoError(t, err)
-
-	err = instance.NamedSingleton("square", func() Shape {
-		return &Rectangle{a: 11}
-	})
-	assert.NoError(t, err)
-
-	var shapes map[string]Shape
-	err = instance.Fill(&shapes)
-	assert.NoError(t, err)
-
-	assert.Equal(t, 2, len(shapes))
-
-	_, ok := shapes["circle"]
-	assert.True(t, ok)
-	assert.IsType(t, &Circle{}, shapes["circle"])
-
-	_, ok = shapes["square"]
-	assert.True(t, ok)
-	assert.IsType(t, &Rectangle{}, shapes["square"])
+	assert.EqualError(t, err, "container: invalid structure")
 }
